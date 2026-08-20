@@ -2,11 +2,13 @@
 """
 JBScrape - iOS Jailbreak Device Finder
 Find iPhones with specific iOS versions on eBay and Swappa
+Jailbreakable ranges: iOS 16.0-16.6.1 and iOS 17.0-17.3.1
 
 Usage:
     python JBScrape.py                           # Interactive mode (eBay ~10 min, default)
     python JBScrape.py --sites swappa            # Swappa only (slow ~20 min)
     python JBScrape.py --sites ebay swappa       # Both sites (slow ~30 min)
+    python JBScrape.py --ocr                     # OCR listing photos to read iOS version
 """
 
 from selenium import webdriver
@@ -18,21 +20,38 @@ import json
 import time
 import re
 import os
+import io
 import subprocess
+import urllib.request
 from datetime import datetime
 from urllib.parse import quote_plus
 from collections import OrderedDict
 import argparse
 
+# Optional OCR stack (only required when --ocr is used)
+try:
+    from PIL import Image
+    import pytesseract
+    _OCR_OK = True
+except Exception:
+    _OCR_OK = False
+
 
 class JBScraper:
     """Unified scraper for finding iPhones with specific iOS versions"""
 
-    def __init__(self, delay=1.5, headless=True):
+    def __init__(self, delay=1.5, headless=True, ocr=False, ocr_max_images=6):
         self.delay = delay
         self.headless = headless
         self.driver = None
         self.all_listings = []
+        # OCR settings
+        self.ocr = ocr and _OCR_OK
+        self.ocr_max_images = ocr_max_images
+        if ocr and not _OCR_OK:
+            print("WARNING: --ocr requested but Pillow/pytesseract not installed. "
+                  "Install with: pip install pillow pytesseract  (and: brew install tesseract). "
+                  "Continuing without OCR.")
 
     def _fix_chromedriver_macos(self, driver_path):
         """Remove macOS quarantine attribute that blocks chromedriver execution"""
@@ -99,7 +118,7 @@ class JBScraper:
 
     def close(self):
         """Close browser"""
-        if self.driver:
+        if getattr(self, 'driver', None):
             self.driver.quit()
             self.driver = None
 
@@ -117,7 +136,10 @@ class JBScraper:
              '16.4', '16.4.1',
              '16.5', '16.5.1',
              '16.6', '16.6.1'],  # 16.6.1 is max jailbreakable
-        17: ['17', '17.0'],  # Only 17.0 is jailbreakable
+        17: ['17', '17.0', '17.0.1', '17.0.2', '17.0.3',
+             '17.1', '17.1.1', '17.1.2',
+             '17.2', '17.2.1',
+             '17.3', '17.3.1'],  # 17.3.1 is max jailbreakable
     }
 
     def generate_version_queries(self, major_versions):
@@ -232,6 +254,113 @@ class JBScraper:
 
         return False
 
+    # ==================== Image OCR ====================
+
+    def extract_ios_version_ocr(self, text):
+        """
+        Looser iOS extraction for OCR'd Settings > About screens.
+
+        The About screen shows the version as "iOS Version 17.3.1",
+        "Software Version 17.3.1", or just "Version 17.3.1" depending on
+        the iOS release, so we accept those phrasings (not only "iOS X").
+        """
+        if not text:
+            return None
+        t = text.lower()
+        # Match "ios/ipados/software version/version <num>"
+        m = re.search(r'(?:ios|ipados|software\s*version|version)\s*[:\-]?\s*'
+                      r'(\d{2}(?:\.\d+){0,2})', t)
+        if m:
+            ver = m.group(1)
+            major = int(ver.split('.')[0])
+            if 12 <= major <= 18:  # plausible modern iOS major
+                return f"iOS {ver}"
+        return None
+
+    def _download_image(self, url, timeout=15):
+        """Download raw image bytes with a browser-like UA."""
+        try:
+            req = urllib.request.Request(
+                url, headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)'})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except Exception:
+            return None
+
+    def _ocr_image_bytes(self, data):
+        """Run tesseract OCR on raw image bytes, return recognized text."""
+        if not data:
+            return ''
+        try:
+            img = Image.open(io.BytesIO(data))
+            # Upscale small thumbnails so the About-screen text is legible
+            w, h = img.size
+            if max(w, h) < 1000:
+                scale = 1000 / max(w, h)
+                img = img.resize((int(w * scale), int(h * scale)))
+            return pytesseract.image_to_string(img)
+        except Exception:
+            return ''
+
+    def _collect_page_image_urls(self, max_images=None):
+        """
+        Collect high-res image URLs from the currently loaded listing page.
+
+        eBay serves thumbnails as s-l64/s-l140/etc; we rewrite those to
+        s-l1600 to get full-resolution photos suitable for OCR.
+        """
+        if max_images is None:
+            max_images = self.ocr_max_images
+        urls = []
+        try:
+            imgs = self.driver.find_elements(By.TAG_NAME, 'img')
+            for im in imgs:
+                src = (im.get_attribute('src')
+                       or im.get_attribute('data-src')
+                       or im.get_attribute('data-zoom-src') or '')
+                if not src.startswith('http'):
+                    continue
+                low = src.lower()
+                is_cdn = ('ebayimg.com' in low or 'swappa' in low)
+                is_img = low.split('?')[0].endswith(('.jpg', '.jpeg', '.png', '.webp'))
+                if not (is_cdn or is_img):
+                    continue
+                # Upgrade eBay thumbnails to full resolution
+                src = re.sub(r's-l\d+\.', 's-l1600.', src)
+                if src not in urls:
+                    urls.append(src)
+                if len(urls) >= max_images:
+                    break
+        except Exception:
+            pass
+        return urls
+
+    def _ocr_listing_ios(self, listing_url, major_versions, navigate=True):
+        """
+        Try to deduce a jailbreakable iOS version from a listing's photos.
+
+        Downloads up to ocr_max_images gallery images, OCRs each, and looks
+        for an About-screen version string. Returns "iOS X.Y.Z" or None.
+        """
+        if not self.ocr or not listing_url:
+            return None
+        try:
+            if navigate:
+                self.driver.get(listing_url)
+                time.sleep(1.5)
+            targets = [int(m) for m in major_versions]
+            for image_url in self._collect_page_image_urls():
+                text = self._ocr_image_bytes(self._download_image(image_url))
+                ver = self.extract_ios_version_ocr(text)
+                if not ver or not self.is_jailbreakable_version(ver):
+                    continue
+                major = int(ver.replace('iOS ', '').split('.')[0])
+                if major in targets:
+                    return ver
+        except Exception:
+            pass
+        return None
+
     # ==================== eBay Scraper ====================
 
     def search_ebay(self, major_versions, max_pages=2, verbose=True):
@@ -241,6 +370,7 @@ class JBScraper:
         queries = self.generate_version_queries(major_versions)
         seen_ids = set()
         listings = []
+        ocr_candidates = OrderedDict()  # item_id -> {url, title} (no iOS in title)
 
         if verbose:
             print(f"\n{'='*60}")
@@ -285,9 +415,22 @@ class JBScraper:
                             if item_id in seen_ids:
                                 continue
 
-                            # Extract and validate iOS version
+                            # Extract and validate iOS version from title
                             ios_ver = self.extract_ios_version(title)
                             if not ios_ver:
+                                # No iOS version in the title. If OCR is enabled,
+                                # queue plausible iPhone listings for image OCR.
+                                if (self.ocr and 'iphone' in title.lower()
+                                        and item_id and item_id not in ocr_candidates
+                                        and item_id not in seen_ids):
+                                    ios_major = str(max(int(m) for m in major_versions))
+                                    if self.is_device_compatible(title, ios_major):
+                                        ocr_candidates[item_id] = {
+                                            'item_id': item_id,
+                                            'url': listing.get('url', ''),
+                                            'title': title,
+                                            'price': listing.get('price', ''),
+                                        }
                                 continue
 
                             if not self.matches_target_versions(title, major_versions):
@@ -304,6 +447,7 @@ class JBScraper:
 
                             seen_ids.add(item_id)
                             listing['ios_version'] = ios_ver
+                            listing['ios_source'] = 'title'
                             listing['source'] = 'ebay'
                             listings.append(listing)
                             new_count += 1
@@ -321,6 +465,39 @@ class JBScraper:
             if verbose:
                 if new_count > 0:
                     print(f"  Found {new_count} new listings")
+
+        # OCR pass: visit queued listings that had no iOS version in the title
+        # and try to read the version off a Settings > About screenshot.
+        if self.ocr and ocr_candidates:
+            if verbose:
+                print(f"\n{'='*60}")
+                print(f"OCR PASS (eBay): {len(ocr_candidates)} listings without iOS in title")
+                print(f"{'='*60}")
+            for idx, cand in enumerate(ocr_candidates.values(), 1):
+                if cand['item_id'] in seen_ids or not cand.get('url'):
+                    continue
+                if verbose:
+                    print(f"  [{idx}/{len(ocr_candidates)}] OCR: {cand['title'][:60]}")
+                ios_ver = self._ocr_listing_ios(cand['url'], major_versions)
+                if not ios_ver:
+                    continue
+                ios_major = ios_ver.replace('iOS ', '').split('.')[0]
+                if not self.is_device_compatible(cand['title'], ios_major):
+                    continue
+                seen_ids.add(cand['item_id'])
+                listings.append({
+                    'item_id': cand['item_id'],
+                    'url': cand['url'],
+                    'title': cand['title'],
+                    'price': cand.get('price', ''),
+                    'ios_version': ios_ver,
+                    'ios_source': 'ocr',
+                    'source': 'ebay',
+                    'scraped_at': datetime.now().isoformat(),
+                })
+                if verbose:
+                    print(f"    FOUND via OCR: {ios_ver}")
+                time.sleep(self.delay)
 
         if verbose:
             print(f"\n{'='*60}")
@@ -517,10 +694,22 @@ class JBScraper:
 
             # Check if iOS version in seller text
             ios_ver = self.extract_ios_version(seller_text)
-            if not ios_ver:
-                return None
+            ios_source = 'description'
 
-            if not self.matches_target_versions(seller_text, major_versions):
+            if ios_ver and self.matches_target_versions(seller_text, major_versions):
+                pass  # found a usable version in the description
+            else:
+                ios_ver = None
+
+            # OCR fallback: read the version off a Settings > About screenshot.
+            # The listing page is already loaded, so no extra navigation needed.
+            if not ios_ver and self.ocr:
+                ocr_ver = self._ocr_listing_ios(listing_url, major_versions, navigate=False)
+                if ocr_ver:
+                    ios_ver = ocr_ver
+                    ios_source = 'ocr'
+
+            if not ios_ver:
                 return None
 
             # Check if jailbreakable
@@ -537,6 +726,7 @@ class JBScraper:
                 'url': listing_url,
                 'title': seller_text[:100].strip(),
                 'ios_version': ios_ver,
+                'ios_source': ios_source,
                 'price': price,
                 'source': 'swappa',
                 'scraped_at': datetime.now().isoformat()
@@ -663,6 +853,7 @@ class JBScraper:
                 ios = item.get('ios_version', '?')
                 storage = item.get('storage', '')
                 jb = ' [JB]' if item.get('is_jailbroken') else ''
+                ocr = ' [OCR]' if item.get('ios_source') == 'ocr' else ''
                 source = item.get('source', 'unknown')
 
                 if source == 'ebay':
@@ -671,7 +862,7 @@ class JBScraper:
                 else:
                     url = item.get('url', '')
 
-                lines.append(f"<p><b>{price}</b> - {storage} - {ios}{jb} - <a href=\"{url}\">{source}</a></p>")
+                lines.append(f"<p><b>{price}</b> - {storage} - {ios}{jb}{ocr} - <a href=\"{url}\">{source}</a></p>")
             lines.append("<br><br>")  # Add spacing between device sections
 
         lines.append("<hr>")
@@ -712,8 +903,9 @@ end tell
                 ios = item.get('ios_version', '?')
                 storage = item.get('storage', '')
                 jb = ' [JB]' if item.get('is_jailbroken') else ''
+                ocr = ' [OCR]' if item.get('ios_source') == 'ocr' else ''
                 source = item.get('source', '')
-                print(f"  {price:12} | {storage:6} | {ios:12} | {source}{jb}")
+                print(f"  {price:12} | {storage:6} | {ios:12} | {source}{jb}{ocr}")
                 count += 1
 
 
@@ -724,7 +916,7 @@ def interactive_mode():
     print("="*60)
     print("\nSearching for jailbreakable versions:")
     print("  iOS 16.0 - 16.6.1")
-    print("  iOS 17.0")
+    print("  iOS 17.0 - 17.3.1")
 
     # Fixed to jailbreakable versions only
     major_versions = [16, 17]
@@ -758,6 +950,14 @@ def interactive_mode():
         else:
             sites = ['ebay', 'swappa']
 
+    # OCR?
+    if _OCR_OK:
+        print("\nOCR listing photos to read iOS version? (slower) (y/N): ", end="")
+        use_ocr = input().strip().lower() == 'y'
+    else:
+        use_ocr = False
+        print("\n(OCR unavailable - install pillow, pytesseract, and tesseract to enable)")
+
     # Headless?
     print("\nShow browser window? (y/N): ", end="")
     show_browser = input().strip().lower() == 'y'
@@ -766,18 +966,19 @@ def interactive_mode():
     print("Create note in Notes app? (Y/n): ", end="")
     create_note = input().strip().lower() != 'n'
 
-    return major_versions, sites, show_browser, create_note
+    return major_versions, sites, show_browser, create_note, use_ocr
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='JBScrape - Find jailbreakable iPhones (iOS 16.0-16.6.1, iOS 17.0)',
+        description='JBScrape - Find jailbreakable iPhones (iOS 16.0-16.6.1, iOS 17.0-17.3.1)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python JBScrape.py                    # Search eBay (~10 min, default)
   python JBScrape.py --sites swappa     # Swappa only (slow ~20 min)
   python JBScrape.py --sites ebay swappa  # Both sites (slow ~30 min)
+  python JBScrape.py --ocr              # OCR listing photos to read iOS version
   python JBScrape.py --no-headless      # Show browser
   python JBScrape.py --note             # Create Notes app entry
         """
@@ -790,6 +991,12 @@ Examples:
                         help='Pages to search per eBay query (default: 2)')
     parser.add_argument('--delay', type=float, default=1.5,
                         help='Delay between requests (default: 1.5)')
+    parser.add_argument('--ocr', action='store_true',
+                        help='Download listing photos and OCR them to read the iOS '
+                             'version off Settings > About screenshots (slower). '
+                             'Requires: pip install pillow pytesseract; brew install tesseract')
+    parser.add_argument('--ocr-images', type=int, default=6,
+                        help='Max images to OCR per listing (default: 6)')
     parser.add_argument('--no-headless', action='store_true',
                         help='Show browser window')
     parser.add_argument('--note', action='store_true',
@@ -805,18 +1012,21 @@ Examples:
     major_versions = [16, 17]
 
     # Interactive mode is default unless specific args are passed
-    has_args = args.sites != ['ebay'] or args.no_headless or args.note or args.output
+    has_args = (args.sites != ['ebay'] or args.no_headless or args.note
+                or args.output or args.ocr)
 
     if args.interactive or not has_args:
-        major_versions, sites, show_browser, create_note = interactive_mode()
+        major_versions, sites, show_browser, create_note, use_ocr = interactive_mode()
         headless = not show_browser
     else:
         sites = args.sites
         headless = not args.no_headless
         create_note = args.note
+        use_ocr = args.ocr
 
     # Create scraper
-    scraper = JBScraper(delay=args.delay, headless=headless)
+    scraper = JBScraper(delay=args.delay, headless=headless,
+                        ocr=use_ocr, ocr_max_images=args.ocr_images)
 
     all_listings = []
 
