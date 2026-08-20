@@ -3,12 +3,15 @@
 JBScrape - iOS Jailbreak Device Finder
 Find iPhones with specific iOS versions on eBay and Swappa
 Jailbreakable ranges: iOS 16.0-16.7.2 and iOS 17.0-17.3.1
+With --legacy: iPhone 11 series and older, any iOS up to 26.0.1
+OCR of listing photos is ON by default (disable with --no-ocr)
 
 Usage:
     python JBScrape.py                           # Interactive mode (eBay ~10 min, default)
+    python JBScrape.py --legacy                  # + iPhone 11 & older up to iOS 26.0.1
     python JBScrape.py --sites swappa            # Swappa only (slow ~20 min)
     python JBScrape.py --sites ebay swappa       # Both sites (slow ~30 min)
-    python JBScrape.py --ocr                     # OCR listing photos to read iOS version
+    python JBScrape.py --no-ocr                  # Disable photo OCR
 """
 
 from selenium import webdriver
@@ -40,18 +43,21 @@ except Exception:
 class JBScraper:
     """Unified scraper for finding iPhones with specific iOS versions"""
 
-    def __init__(self, delay=1.5, headless=True, ocr=False, ocr_max_images=6):
+    def __init__(self, delay=1.5, headless=True, ocr=True, ocr_max_images=6,
+                 legacy=False):
         self.delay = delay
         self.headless = headless
         self.driver = None
         self.all_listings = []
-        # OCR settings
+        # OCR is on by default; disable with --no-ocr
         self.ocr = ocr and _OCR_OK
         self.ocr_max_images = ocr_max_images
+        # Legacy mode: iPhone 11 series and older, up to iOS 26.0.1
+        self.legacy = legacy
         if ocr and not _OCR_OK:
-            print("WARNING: --ocr requested but Pillow/pytesseract not installed. "
+            print("WARNING: OCR is enabled but Pillow/pytesseract are not installed. "
                   "Install with: pip install pillow pytesseract  (and: brew install tesseract). "
-                  "Continuing without OCR.")
+                  "Continuing without OCR (pass --no-ocr to silence this).")
 
     def _fix_chromedriver_macos(self, driver_path):
         """Remove macOS quarantine attribute that blocks chromedriver execution"""
@@ -255,6 +261,66 @@ class JBScraper:
 
         return False
 
+    # ==================== Legacy / extended acceptance ====================
+
+    # Newest iOS reachable in --legacy mode (iPhone 11 series and older).
+    LEGACY_MAX_IOS = (26, 0, 1)
+    # device_order from get_device_info(): iPhone 12+ are <= 16, so >= 17 means
+    # "iPhone 11 series and older" (11 Pro Max=17 ... older). Excludes iPhone 12+.
+    LEGACY_MIN_DEVICE_ORDER = 17
+
+    @staticmethod
+    def _ver_tuple(ios_version):
+        """'iOS 26.0.1' -> (26, 0, 1); missing parts default to 0."""
+        ver = (ios_version or '').replace('iOS', '').strip()
+        nums = []
+        for p in ver.split('.')[:3]:
+            try:
+                nums.append(int(p))
+            except ValueError:
+                nums.append(0)
+        while len(nums) < 3:
+            nums.append(0)
+        return tuple(nums)
+
+    def is_legacy_device(self, text):
+        """
+        True if the listing is an iPhone 11 series or older model
+        (i.e. NOT iPhone 12 or newer). Used by --legacy mode.
+        """
+        name, order = self.get_device_info(text)
+        return name != 'Other iPhone' and order >= self.LEGACY_MIN_DEVICE_ORDER
+
+    def target_majors(self, base_majors):
+        """
+        Major versions to search/match. In legacy mode we also look for
+        iOS 18 and iOS 26 (17.x already covers 17.4-17.7.x via matching).
+        """
+        majors = [int(m) for m in base_majors]
+        if self.legacy:
+            for extra in (18, 26):
+                if extra not in majors:
+                    majors.append(extra)
+        return majors
+
+    def accepts_version(self, ios_version, text):
+        """
+        Final gate: is this (device, iOS version) an accepted jailbreak target?
+
+        - Default: the 16.x / 17.x jailbreakable whitelist (any compatible device).
+        - --legacy: additionally, iPhone 11 series and older running anything up
+          to iOS 26.0.1 (checkm8/older-hardware style coverage).
+        """
+        if not ios_version:
+            return False
+        if self.is_jailbreakable_version(ios_version):
+            return True
+        if self.legacy and self.is_legacy_device(text):
+            vt = self._ver_tuple(ios_version)
+            if (12, 0, 0) <= vt <= self.LEGACY_MAX_IOS:
+                return True
+        return False
+
     # ==================== Image OCR ====================
 
     def extract_ios_version_ocr(self, text):
@@ -278,8 +344,9 @@ class JBScraper:
         for mo in re.finditer(r'\b(\d{2})\.(\d{1,2})(?:\.(\d{1,2}))?\b', t):
             major, minor = int(mo.group(1)), int(mo.group(2))
             patch = int(mo.group(3)) if mo.group(3) else 0
-            # Plausible modern iOS: major 12-18, small minor/patch
-            if not (12 <= major <= 18 and 0 <= minor <= 9 and 0 <= patch <= 20):
+            # Plausible modern iOS majors (12-18, then 26 - Apple skipped 19-25)
+            if not ((12 <= major <= 18 or major == 26)
+                    and 0 <= minor <= 9 and 0 <= patch <= 20):
                 continue
             ver = f"{major}.{minor}" + (f".{patch}" if mo.group(3) else "")
             cand = f"iOS {ver}"
@@ -347,12 +414,15 @@ class JBScraper:
             pass
         return urls
 
-    def _ocr_listing_ios(self, listing_url, major_versions, navigate=True):
+    def _ocr_listing_ios(self, listing_url, major_versions, listing_text='',
+                         navigate=True):
         """
-        Try to deduce a jailbreakable iOS version from a listing's photos.
+        Try to deduce an accepted iOS version from a listing's photos.
 
         Downloads up to ocr_max_images gallery images, OCRs each, and looks
-        for an About-screen version string. Returns "iOS X.Y.Z" or None.
+        for an About-screen version string. listing_text (title/description)
+        is used for device-tier checks in --legacy mode. Returns "iOS X.Y.Z"
+        or None.
         """
         if not self.ocr or not listing_url:
             return None
@@ -360,14 +430,14 @@ class JBScraper:
             if navigate:
                 self.driver.get(listing_url)
                 time.sleep(1.5)
-            targets = [int(m) for m in major_versions]
+            targets = set(self.target_majors(major_versions))
             for image_url in self._collect_page_image_urls():
                 text = self._ocr_image_bytes(self._download_image(image_url))
                 ver = self.extract_ios_version_ocr(text)
-                if not ver or not self.is_jailbreakable_version(ver):
+                if not ver:
                     continue
                 major = int(ver.replace('iOS ', '').split('.')[0])
-                if major in targets:
+                if major in targets and self.accepts_version(ver, listing_text):
                     return ver
         except Exception:
             pass
@@ -379,7 +449,9 @@ class JBScraper:
         """Search eBay for iPhones with specific iOS versions"""
         self._init_browser()
 
-        queries = self.generate_version_queries(major_versions)
+        search_majors = self.target_majors(major_versions)
+        min_major = str(min(search_majors))
+        queries = self.generate_version_queries(search_majors)
         seen_ids = set()
         listings = []
         ocr_candidates = OrderedDict()  # item_id -> {url, title} (no iOS in title)
@@ -388,7 +460,9 @@ class JBScraper:
             print(f"\n{'='*60}")
             print("SEARCHING EBAY")
             print(f"{'='*60}")
-            print(f"Target iOS versions: {', '.join(str(v) for v in major_versions)}")
+            print(f"Target iOS majors: {', '.join(str(v) for v in search_majors)}"
+                  + (" (legacy: iPhone 11 series & older up to iOS 26.0.1)"
+                     if self.legacy else ""))
             print(f"Total queries to run: {len(queries)}")
 
         for i, query in enumerate(queries, 1):
@@ -432,11 +506,13 @@ class JBScraper:
                             if not ios_ver:
                                 # No iOS version in the title. If OCR is enabled,
                                 # queue plausible iPhone listings for image OCR.
+                                # Gate on the LOWEST target major so devices that
+                                # only run the older iOS (e.g. iPhone 8 -> iOS 16)
+                                # are still queued for OCR.
                                 if (self.ocr and 'iphone' in title.lower()
                                         and item_id and item_id not in ocr_candidates
                                         and item_id not in seen_ids):
-                                    ios_major = str(max(int(m) for m in major_versions))
-                                    if self.is_device_compatible(title, ios_major):
+                                    if self.is_device_compatible(title, min_major):
                                         ocr_candidates[item_id] = {
                                             'item_id': item_id,
                                             'url': listing.get('url', ''),
@@ -445,7 +521,7 @@ class JBScraper:
                                         }
                                 continue
 
-                            if not self.matches_target_versions(title, major_versions):
+                            if not self.matches_target_versions(title, search_majors):
                                 continue
 
                             # Check device compatibility (filter impossible combos like iPhone 4 + iOS 16)
@@ -453,8 +529,8 @@ class JBScraper:
                             if not self.is_device_compatible(title, ios_major):
                                 continue
 
-                            # Check if version is actually jailbreakable
-                            if not self.is_jailbreakable_version(ios_ver):
+                            # Final acceptance (jailbreakable whitelist, or legacy range)
+                            if not self.accepts_version(ios_ver, title):
                                 continue
 
                             seen_ids.add(item_id)
@@ -490,7 +566,8 @@ class JBScraper:
                     continue
                 if verbose:
                     print(f"  [{idx}/{len(ocr_candidates)}] OCR: {cand['title'][:60]}")
-                ios_ver = self._ocr_listing_ios(cand['url'], major_versions)
+                ios_ver = self._ocr_listing_ios(cand['url'], major_versions,
+                                                listing_text=cand['title'])
                 if not ios_ver:
                     continue
                 ios_major = ios_ver.replace('iOS ', '').split('.')[0]
@@ -708,7 +785,8 @@ class JBScraper:
             ios_ver = self.extract_ios_version(seller_text)
             ios_source = 'description'
 
-            if ios_ver and self.matches_target_versions(seller_text, major_versions):
+            if ios_ver and self.matches_target_versions(
+                    seller_text, self.target_majors(major_versions)):
                 pass  # found a usable version in the description
             else:
                 ios_ver = None
@@ -716,7 +794,8 @@ class JBScraper:
             # OCR fallback: read the version off a Settings > About screenshot.
             # The listing page is already loaded, so no extra navigation needed.
             if not ios_ver and self.ocr:
-                ocr_ver = self._ocr_listing_ios(listing_url, major_versions, navigate=False)
+                ocr_ver = self._ocr_listing_ios(listing_url, major_versions,
+                                                listing_text=seller_text, navigate=False)
                 if ocr_ver:
                     ios_ver = ocr_ver
                     ios_source = 'ocr'
@@ -724,8 +803,8 @@ class JBScraper:
             if not ios_ver:
                 return None
 
-            # Check if jailbreakable
-            if not self.is_jailbreakable_version(ios_ver):
+            # Final acceptance (jailbreakable whitelist, or legacy range)
+            if not self.accepts_version(ios_ver, seller_text):
                 return None
 
             # Check device compatibility
@@ -929,6 +1008,7 @@ def interactive_mode():
     print("\nSearching for jailbreakable versions:")
     print("  iOS 16.0 - 16.7.2")
     print("  iOS 17.0 - 17.3.1")
+    print("  (+ legacy option: iPhone 11 & older up to iOS 26.0.1)")
 
     # Fixed to jailbreakable versions only
     major_versions = [16, 17]
@@ -962,10 +1042,15 @@ def interactive_mode():
         else:
             sites = ['ebay', 'swappa']
 
-    # OCR?
+    # Legacy devices (iPhone 11 series & older, up to iOS 26.0.1)?
+    print("\nAlso include legacy devices (iPhone 11 series & older) up to iOS 26.0.1?")
+    print("  (y/N): ", end="")
+    use_legacy = input().strip().lower() == 'y'
+
+    # OCR? (on by default)
     if _OCR_OK:
-        print("\nOCR listing photos to read iOS version? (slower) (y/N): ", end="")
-        use_ocr = input().strip().lower() == 'y'
+        print("\nOCR listing photos to read iOS version? (slower) (Y/n): ", end="")
+        use_ocr = input().strip().lower() != 'n'
     else:
         use_ocr = False
         print("\n(OCR unavailable - install pillow, pytesseract, and tesseract to enable)")
@@ -978,7 +1063,7 @@ def interactive_mode():
     print("Create note in Notes app? (Y/n): ", end="")
     create_note = input().strip().lower() != 'n'
 
-    return major_versions, sites, show_browser, create_note, use_ocr
+    return major_versions, sites, show_browser, create_note, use_ocr, use_legacy
 
 
 def main():
@@ -987,10 +1072,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python JBScrape.py                    # Search eBay (~10 min, default)
+  python JBScrape.py                    # Search eBay, OCR on (~10 min, default)
+  python JBScrape.py --legacy           # Also iPhone 11 & older up to iOS 26.0.1
   python JBScrape.py --sites swappa     # Swappa only (slow ~20 min)
   python JBScrape.py --sites ebay swappa  # Both sites (slow ~30 min)
-  python JBScrape.py --ocr              # OCR listing photos to read iOS version
+  python JBScrape.py --no-ocr           # Skip photo OCR (title/description only)
   python JBScrape.py --no-headless      # Show browser
   python JBScrape.py --note             # Create Notes app entry
         """
@@ -1003,9 +1089,14 @@ Examples:
                         help='Pages to search per eBay query (default: 2)')
     parser.add_argument('--delay', type=float, default=1.5,
                         help='Delay between requests (default: 1.5)')
-    parser.add_argument('--ocr', action='store_true',
-                        help='Download listing photos and OCR them to read the iOS '
-                             'version off Settings > About screenshots (slower). '
+    parser.add_argument('--legacy', action='store_true',
+                        help='Also match iPhone 11 series and older running any iOS '
+                             'up to 26.0.1 (checkm8/older-hardware coverage). '
+                             'iPhone 12 and newer stay limited to the 16.x/17.x range.')
+    parser.add_argument('--no-ocr', action='store_true',
+                        help='Disable photo OCR. OCR is ON by default: listing photos '
+                             'are downloaded and the iOS version is read off '
+                             'Settings > About screenshots when it is not in the text. '
                              'Requires: pip install pillow pytesseract; brew install tesseract')
     parser.add_argument('--ocr-images', type=int, default=6,
                         help='Max images to OCR per listing (default: 6)')
@@ -1025,20 +1116,23 @@ Examples:
 
     # Interactive mode is default unless specific args are passed
     has_args = (args.sites != ['ebay'] or args.no_headless or args.note
-                or args.output or args.ocr)
+                or args.output or args.no_ocr or args.legacy)
 
     if args.interactive or not has_args:
-        major_versions, sites, show_browser, create_note, use_ocr = interactive_mode()
+        (major_versions, sites, show_browser,
+         create_note, use_ocr, use_legacy) = interactive_mode()
         headless = not show_browser
     else:
         sites = args.sites
         headless = not args.no_headless
         create_note = args.note
-        use_ocr = args.ocr
+        use_ocr = not args.no_ocr
+        use_legacy = args.legacy
 
     # Create scraper
     scraper = JBScraper(delay=args.delay, headless=headless,
-                        ocr=use_ocr, ocr_max_images=args.ocr_images)
+                        ocr=use_ocr, ocr_max_images=args.ocr_images,
+                        legacy=use_legacy)
 
     all_listings = []
 
