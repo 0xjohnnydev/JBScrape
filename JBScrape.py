@@ -2,7 +2,7 @@
 """
 JBScrape - iOS Jailbreak Device Finder
 Find iPhones with specific iOS versions on eBay and Swappa
-Jailbreakable ranges: iOS 16.0-16.6.1 and iOS 17.0-17.3.1
+Jailbreakable ranges: iOS 16.0-16.7.2 and iOS 17.0-17.3.1
 
 Usage:
     python JBScrape.py                           # Interactive mode (eBay ~10 min, default)
@@ -135,7 +135,8 @@ class JBScraper:
              '16.3', '16.3.1',
              '16.4', '16.4.1',
              '16.5', '16.5.1',
-             '16.6', '16.6.1'],  # 16.6.1 is max jailbreakable
+             '16.6', '16.6.1',
+             '16.7', '16.7.1', '16.7.2'],  # 16.7.2 is max jailbreakable
         17: ['17', '17.0', '17.0.1', '17.0.2', '17.0.3',
              '17.1', '17.1.1', '17.1.2',
              '17.2', '17.2.1',
@@ -260,22 +261,33 @@ class JBScraper:
         """
         Looser iOS extraction for OCR'd Settings > About screens.
 
-        The About screen shows the version as "iOS Version 17.3.1",
-        "Software Version 17.3.1", or just "Version 17.3.1" depending on
-        the iOS release, so we accept those phrasings (not only "iOS X").
+        On a real About screen the label ("Software Version" / "iOS Version")
+        is left-aligned and the value ("17.3.1") is right-aligned, so OCR
+        usually reads them on separate lines / far apart. So we don't require
+        the keyword to sit next to the number: instead we (1) confirm some
+        version context exists anywhere in the text, then (2) pick the first
+        plausible iOS version token, preferring a known-jailbreakable one.
         """
         if not text:
             return None
         t = text.lower()
-        # Match "ios/ipados/software version/version <num>"
-        m = re.search(r'(?:ios|ipados|software\s*version|version)\s*[:\-]?\s*'
-                      r'(\d{2}(?:\.\d+){0,2})', t)
-        if m:
-            ver = m.group(1)
-            major = int(ver.split('.')[0])
-            if 12 <= major <= 18:  # plausible modern iOS major
-                return f"iOS {ver}"
-        return None
+        # Gate on version context to avoid matching model IDs, prices, capacity
+        if not re.search(r'\b(?:ios|ipados|version|software)\b', t):
+            return None
+        best = None
+        for mo in re.finditer(r'\b(\d{2})\.(\d{1,2})(?:\.(\d{1,2}))?\b', t):
+            major, minor = int(mo.group(1)), int(mo.group(2))
+            patch = int(mo.group(3)) if mo.group(3) else 0
+            # Plausible modern iOS: major 12-18, small minor/patch
+            if not (12 <= major <= 18 and 0 <= minor <= 9 and 0 <= patch <= 20):
+                continue
+            ver = f"{major}.{minor}" + (f".{patch}" if mo.group(3) else "")
+            cand = f"iOS {ver}"
+            if self.is_jailbreakable_version(cand):
+                return cand  # prefer a known-jailbreakable match
+            if best is None:
+                best = cand
+        return best
 
     def _download_image(self, url, timeout=15):
         """Download raw image bytes with a browser-like UA."""
@@ -915,7 +927,7 @@ def interactive_mode():
     print("  JBScrape - iOS Jailbreak Device Finder")
     print("="*60)
     print("\nSearching for jailbreakable versions:")
-    print("  iOS 16.0 - 16.6.1")
+    print("  iOS 16.0 - 16.7.2")
     print("  iOS 17.0 - 17.3.1")
 
     # Fixed to jailbreakable versions only
@@ -971,7 +983,7 @@ def interactive_mode():
 
 def main():
     parser = argparse.ArgumentParser(
-        description='JBScrape - Find jailbreakable iPhones (iOS 16.0-16.6.1, iOS 17.0-17.3.1)',
+        description='JBScrape - Find jailbreakable iPhones (iOS 16.0-16.7.2, iOS 17.0-17.3.1)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:

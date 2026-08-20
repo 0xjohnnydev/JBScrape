@@ -2,7 +2,7 @@
 
 Find jailbreakable iPhones on eBay and Swappa.
 
-Searches for devices running **iOS 16.0-16.6.1** and **iOS 17.0-17.3.1**.
+Searches for devices running **iOS 16.0-16.7.2** and **iOS 17.0-17.3.1**.
 
 ## Features
 
