@@ -1,2 +1,7 @@
 selenium>=4.0.0
 webdriver-manager>=4.0.0
+
+# Optional: only needed for --ocr (reading iOS version off listing photos).
+# Also requires the tesseract binary: `brew install tesseract`
+pillow>=10.0.0
+pytesseract>=0.3.10
